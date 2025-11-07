@@ -58,9 +58,9 @@ seen_items = load_seen()
 # 5. DISCORD
 # ----------------------
 def send_status_message(message_content):
-    status_webhook_url = os.getenv("DISCORD_WEBHOOK_STATUS")
+    status_webhook_url = os.getenv("DISCORD_WEBHOOK")
     if not status_webhook_url:
-        logger.warning("DISCORD_WEBHOOK_STATUS non configuré, impossible d'envoyer le message de statut.")
+        logger.warning("DISCORD_WEBHOOK non configuré, impossible d'envoyer le message de statut.")
         return
 
     message = {"content": message_content}
