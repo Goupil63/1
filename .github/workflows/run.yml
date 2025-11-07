@@ -1,1 +1,53 @@
-s
+name: Goupil
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write 
+      
+    concurrency:
+      group: goupil
+      cancel-in-progress: true  # Si un run est déjà en cours pour ce groupe, annule-le immédiatement et laisse le nouveau run prendre sa place
+
+      
+# 1️⃣ Récupération du code
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+        
+# 2️⃣ Setup Python
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.x"
+
+
+# 3️⃣ Installation des dépendances
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4
+
+
+# 4️⃣ Lancement du script
+      - name: Run Vinted Bot
+        env:
+          VINTED_URLS: "https://www.vinted.fr/catalog?search_text=les%20demeures%20de%20l%27%C3%A9pouvante&catalog[]=4824&page=1&time=1758482317&order=newest_first,https://www.vinted.fr/catalog?search_text=les%20contr%C3%A9es%20de%20l%27horreur&catalog[]=4824&page=1&time=1758748760&order=newest_first,https://www.vinted.fr/catalog?search_text=horreur%20%C3%A0%20arkham&catalog[]=4824&page=1&time=1758748852&order=newest_first"
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          DISCORD_WEBHOOK_STATUS: ${{ secrets.DISCORD_WEBHOOK_STATUS }}
+        run: python main.py
+          
+
+# 5️⃣ Commit automatique de seen.json
+      - name: Commit seen.json        
+        run: |
+          git config --global user.name "Goupil"
+          git config --global user.email "vinted-bot@example.com"
+          git add seen.json
+          git commit -m "Update seen.json [ci skip]" || echo "✅ Pas de nouvelles annonces à commit"
+          git push
