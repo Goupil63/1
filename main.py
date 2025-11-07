@@ -175,7 +175,7 @@ def bot_loop():
         check_vinted()
 
         # Sleep aléatoire mais ne dépasse pas la fin du run
-        delay = random.uniform(180, 360)  # 3 à 6 minutes
+        delay = random.uniform(120, 180)  # 2 à 3 minutes
         time_remaining = end_time - time.time()
         if time_remaining <= 0:
             break
