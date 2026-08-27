@@ -2,7 +2,9 @@ name: Goupil
 
 on:
   workflow_dispatch:
-
+  schedule:
+    - cron: '0 */4 * * *'   # relance auto toutes les 4h, en sécurité sous les 5h50 du script
+    
 jobs:
   run-bot:
     runs-on: ubuntu-latest
