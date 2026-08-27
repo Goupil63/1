@@ -4,7 +4,7 @@ import os
 import logging
 import requests
 import json
-from bs4 import BeautifulSoup
+from urllib.parse import urlparse, parse_qs
 
 # ----------------------
 # 1. CONFIGURATION
@@ -85,6 +85,67 @@ def save_seen(seen_items):
 seen_items = load_seen()
 
 # ----------------------
+# 4bis. API VINTED (au lieu du HTML, qui est maintenant chargé en JS)
+# ----------------------
+API_URL = "https://www.vinted.fr/api/v2/catalog/items"
+_last_warmup = 0
+WARMUP_INTERVAL = 15 * 60  # ré-établit le cookie anti-bot toutes les 15 min
+
+def warm_up():
+    """Visite la page d'accueil pour obtenir les cookies anti-bot (Datadome)
+    nécessaires avant d'appeler l'API. À refaire régulièrement, le cookie expire."""
+    global _last_warmup
+    try:
+        session.get("https://www.vinted.fr/", timeout=12)
+        _last_warmup = time.time()
+        logger.info("🍪 Cookies de session renouvelés")
+    except Exception as e:
+        logger.warning(f"Échec du renouvellement des cookies : {e}")
+
+def maybe_warm_up():
+    if time.time() - _last_warmup > WARMUP_INTERVAL:
+        warm_up()
+
+def build_api_params(vinted_url):
+    """Convertit une URL de recherche Vinted (copiée depuis le site)
+    en paramètres pour l'API interne /api/v2/catalog/items."""
+    qs = parse_qs(urlparse(vinted_url).query)
+    params = {
+        "search_text": qs.get("search_text", [""])[0],
+        "order": qs.get("order", ["newest_first"])[0],
+        "page": 1,
+        "per_page": 20,
+    }
+    catalog_ids = qs.get("catalog[]") or qs.get("catalog_ids")
+    if catalog_ids:
+        params["catalog_ids"] = ",".join(catalog_ids)
+    return params
+
+def parse_item(item):
+    """Extrait titre / prix / lien / photo d'un item JSON de l'API, en gérant
+    plusieurs formats possibles (l'API évolue de temps en temps elle aussi)."""
+    title = item.get("title", "Article sans titre")
+
+    price_obj = item.get("total_item_price") or item.get("price")
+    if isinstance(price_obj, dict):
+        amount = price_obj.get("amount", "?")
+        currency = price_obj.get("currency_code", "EUR")
+        price = f"{amount} {currency}"
+    else:
+        price = str(price_obj) if price_obj else "prix inconnu"
+
+    link = item.get("url")
+    if not link and item.get("id"):
+        link = f"https://www.vinted.fr/items/{item['id']}"
+
+    photo = item.get("photo") or {}
+    if not photo and item.get("photos"):
+        photo = item["photos"][0] if item["photos"] else {}
+    img_url = photo.get("url", "") if isinstance(photo, dict) else ""
+
+    return title, price, link, img_url
+
+# ----------------------
 # 5. DISCORD
 # ----------------------
 def send_status_message(message_content):
@@ -144,16 +205,27 @@ def check_vinted():
     total_new_items = 0
     now = time.time()
 
+    maybe_warm_up()
+
     for url in VINTED_URLS:
         logger.info(f"🌐 Analyse de l'URL : {url}")
         try:
-            resp = session.get(url, timeout=12)
+            params = build_api_params(url)
+            resp = session.get(
+                API_URL,
+                params=params,
+                headers={"Accept": "application/json, text/plain, */*"},
+                timeout=12,
+            )
 
             if resp.status_code == 403:
-                logger.error(f"🔴 ERREUR CRITIQUE 403 pour l'URL {url}. Blocage IP ou User-Agent.")
+                logger.error(f"🔴 ERREUR CRITIQUE 403 pour l'URL {url}. Blocage anti-bot (Datadome).")
                 send_error_alert("HTTP 403 FORBIDDEN - BLOCAGE",
-                                  "L'adresse IP est probablement bloquée ou le User-Agent est détecté. Considérez l'utilisation de Proxies.",
+                                  "Le cookie anti-bot est probablement expiré ou invalide, ou l'IP est bloquée.",
                                   url)
+                # on force un renouvellement de cookies au prochain tour
+                global _last_warmup
+                _last_warmup = 0
                 continue
 
             if resp.status_code != 200:
@@ -161,28 +233,25 @@ def check_vinted():
                 send_error_alert(f"HTTP {resp.status_code} Bloqué", f"Statut : {resp.status_code}", url)
                 continue
 
-            soup = BeautifulSoup(resp.text, "html.parser")
-            container = soup.find("div", class_="feed-grid")
-            if not container:
-                logger.warning(f"❌ Container feed-grid non trouvé pour l'URL {url}")
-                send_error_alert("Structure HTML cassée", "Le conteneur 'feed-grid' est introuvable. Vinted a peut-être changé sa mise en page ou l'accès est bloqué.", url)
+            try:
+                data = resp.json()
+            except ValueError as e:
+                logger.warning(f"❌ Réponse non-JSON pour l'URL {url}")
+                send_error_alert("Réponse API illisible", f"La réponse n'est pas du JSON valide : {e}", url)
                 continue
 
-            items = container.find_all("div", class_="feed-grid__item")
+            items = data.get("items", [])
+            if not items and "items" not in data:
+                logger.warning(f"❌ Clé 'items' absente de la réponse pour l'URL {url}")
+                send_error_alert("Structure API changée", f"Clés reçues : {list(data.keys())}", url)
+                continue
+
             new_items_count = 0
 
             for item in items[:20]:
                 try:
-                    link_tag = item.find("a", {"data-testid": lambda x: x and 'overlay-link' in x})
-                    if link_tag and 'title' in link_tag.attrs:
-                        link = link_tag['href']
-                        if not link.startswith("http"):
-                            link = "https://www.vinted.fr" + link
-                        full_title = link_tag['title']
-                        parts = full_title.split(', ')
-                        title = parts[0]
-                        price = parts[-2]
-                    else:
+                    title, price, link, img_url = parse_item(item)
+                    if not link:
                         continue
 
                     if link in seen_items:
@@ -190,9 +259,6 @@ def check_vinted():
 
                     seen_items[link] = now
                     new_items_count += 1
-
-                    img_tag = item.find("img")
-                    img_url = img_tag['src'] if img_tag and img_tag.get('src') else ""
 
                     logger.info(f"🔔 Nouvelle annonce : {title} - {price}\n🔗 {link}")
                     send_to_discord(title, price, link, img_url)
@@ -226,6 +292,7 @@ def check_vinted():
 # 7. BOUCLE BOT AVEC DUREE LIMITEE
 # ----------------------
 def bot_loop():
+    warm_up()
     end_time = time.time() + RUN_DURATION
     while time.time() < end_time:
         logger.info("▶️ Nouvelle analyse...")
