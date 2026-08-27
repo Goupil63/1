@@ -12,11 +12,19 @@ from bs4 import BeautifulSoup
 VINTED_URLS = os.getenv("VINTED_URLS", "").split(',')
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")
 SEEN_FILE = "seen.json"
-RUN_DURATION = 1 * 3600 + 50 * 60  # 1 * 3600 + 50 * 60 Durée du run en secondes (1h50)
+
+# Durée du run en secondes. Le repo est public -> minutes Actions illimitées,
+# mais un job hébergé GitHub est de toute façon plafonné à 6h : on reste
+# volontairement en dessous pour laisser de la marge au relais du cron.
+RUN_DURATION = 5 * 3600 + 50 * 60  # 5h50
+
+# Combien de temps on garde une annonce dans la mémoire "seen" avant de
+# l'oublier (évite que seen.json grossisse indéfiniment).
+SEEN_TTL_DAYS = 30
 
 # Configuration pour les alertes d'erreur (si DISCORD_ERROR_WEBHOOK est défini)
-ERROR_WEBHOOK = os.getenv("DISCORD_ERROR_WEBHOOK", DISCORD_WEBHOOK) # Utilise le webhook principal par défaut
-ERROR_COLOR = 15158332 # Rouge pour l'alerte
+ERROR_WEBHOOK = os.getenv("DISCORD_ERROR_WEBHOOK", DISCORD_WEBHOOK)  # Utilise le webhook principal par défaut
+ERROR_COLOR = 15158332  # Rouge pour l'alerte
 
 if not VINTED_URLS:
     raise SystemExit("⚠️ VINTED_URLS non configuré dans les Secrets.")
@@ -34,7 +42,6 @@ logger = logging.getLogger("goupil")
 # ----------------------
 session = requests.Session()
 session.headers.update({
-    # NOUVEAU User-Agent Chrome pour une meilleure furtivité
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
@@ -42,7 +49,6 @@ session.headers.update({
     "Connection": "keep-alive",
     "DNT": "1",
     "Upgrade-Insecure-Requests": "1",
-    # En-têtes de sécurité additionnels (mimant un navigateur)
     "Sec-Fetch-Dest": "document",
     "Sec-Fetch-Mode": "navigate",
     "Sec-Fetch-Site": "none",
@@ -50,17 +56,31 @@ session.headers.update({
 })
 
 # ----------------------
-# 4. MEMOIRE PERSISTANTE
+# 4. MEMOIRE PERSISTANTE (avec purge par ancienneté)
 # ----------------------
 def load_seen():
+    """seen.json est maintenant un dict {lien: timestamp_premiere_vue}.
+    Compatible avec l'ancien format (liste de liens) : les anciens liens
+    sont réimportés avec le timestamp actuel."""
     if os.path.exists(SEEN_FILE):
         with open(SEEN_FILE, "r") as f:
-            return set(json.load(f))
-    return set()
+            data = json.load(f)
+        if isinstance(data, list):
+            now = time.time()
+            return {link: now for link in data}
+        return data
+    return {}
 
 def save_seen(seen_items):
+    # Purge des entrées plus vieilles que SEEN_TTL_DAYS
+    cutoff = time.time() - SEEN_TTL_DAYS * 86400
+    pruned = {link: ts for link, ts in seen_items.items() if ts >= cutoff}
+    removed = len(seen_items) - len(pruned)
+    if removed:
+        logger.info(f"🧹 {removed} ancienne(s) entrée(s) purgée(s) de seen.json")
     with open(SEEN_FILE, "w") as f:
-        json.dump(list(seen_items), f)
+        json.dump(pruned, f)
+    return pruned
 
 seen_items = load_seen()
 
@@ -68,11 +88,11 @@ seen_items = load_seen()
 # 5. DISCORD
 # ----------------------
 def send_status_message(message_content):
-    status_webhook_url = os.getenv("DISCORD_WEBHOOK")
+    # Utilise un webhook dédié au statut si défini, sinon retombe sur le webhook principal
+    status_webhook_url = os.getenv("DISCORD_WEBHOOK_STATUS", DISCORD_WEBHOOK)
     if not status_webhook_url:
-        logger.warning("DISCORD_WEBHOOK non configuré, impossible d'envoyer le message de statut.")
+        logger.warning("Aucun webhook de statut configuré, message ignoré.")
         return
-
     message = {"content": message_content}
     try:
         requests.post(status_webhook_url, json=message, timeout=10)
@@ -100,8 +120,7 @@ def send_to_discord(title, price, link, img_url=""):
         logger.error(f"Erreur en envoyant à Discord : {e}")
 
 def send_error_alert(error_type, details, url="N/A"):
-    details_str = str(details)[:1500] 
-    
+    details_str = str(details)[:1500]
     data = {
         "embeds": [{
             "title": f"❌ ALERTE ERREUR SCRAPING : {error_type}",
@@ -121,78 +140,66 @@ def send_error_alert(error_type, details, url="N/A"):
 # 6. SCRAPER VINTED (one-shot)
 # ----------------------
 def check_vinted():
+    global seen_items
     total_new_items = 0
-    # Boucle sur chaque URL dans la liste
+    now = time.time()
+
     for url in VINTED_URLS:
         logger.info(f"🌐 Analyse de l'URL : {url}")
-        
-        # BLOC 1 : REQUÊTE HTTP
         try:
             resp = session.get(url, timeout=12)
-            
-            # --- LOGIQUE D'ALERTE 403 SPÉCIFIQUE ---
+
             if resp.status_code == 403:
                 logger.error(f"🔴 ERREUR CRITIQUE 403 pour l'URL {url}. Blocage IP ou User-Agent.")
-                send_error_alert("HTTP 403 FORBIDDEN - BLOCAGE", 
-                                 "L'adresse IP est probablement bloquée ou le User-Agent est détecté. Considérez l'utilisation de Proxies.", 
-                                 url)
-                continue # Passe à l'URL suivante
-            # -------------------------------------
+                send_error_alert("HTTP 403 FORBIDDEN - BLOCAGE",
+                                  "L'adresse IP est probablement bloquée ou le User-Agent est détecté. Considérez l'utilisation de Proxies.",
+                                  url)
+                continue
 
             if resp.status_code != 200:
                 logger.warning(f"Réponse inattendue {resp.status_code} pour l'URL {url}")
-                # Alerte pour toute autre erreur HTTP (500, 404, etc.)
                 send_error_alert(f"HTTP {resp.status_code} Bloqué", f"Statut : {resp.status_code}", url)
-                continue # Passe à l'URL suivante
+                continue
 
-            # BLOC 2 : PARSING HTML
             soup = BeautifulSoup(resp.text, "html.parser")
             container = soup.find("div", class_="feed-grid")
             if not container:
                 logger.warning(f"❌ Container feed-grid non trouvé pour l'URL {url}")
-                # ALERTE POUR STRUCTURE HTML CASSÉE
                 send_error_alert("Structure HTML cassée", "Le conteneur 'feed-grid' est introuvable. Vinted a peut-être changé sa mise en page ou l'accès est bloqué.", url)
-                continue # Passe à l'URL suivante
+                continue
 
             items = container.find_all("div", class_="feed-grid__item")
-            
             new_items_count = 0
+
             for item in items[:20]:
-                
-                # BLOC 3 : TRAITEMENT DE L'ARTICLE
                 try:
-                    # Lien et extraction du titre et du prix
                     link_tag = item.find("a", {"data-testid": lambda x: x and 'overlay-link' in x})
-                    
                     if link_tag and 'title' in link_tag.attrs:
                         link = link_tag['href']
                         if not link.startswith("http"):
                             link = "https://www.vinted.fr" + link
-
                         full_title = link_tag['title']
                         parts = full_title.split(', ')
                         title = parts[0]
                         price = parts[-2]
                     else:
-                        continue # Passe à l'article suivant si le lien ou le titre n'est pas trouvé
+                        continue
 
                     if link in seen_items:
                         continue
-                    seen_items.add(link)
-                    new_items_count += 1
-                
 
-                    # Image
+                    seen_items[link] = now
+                    new_items_count += 1
+
                     img_tag = item.find("img")
                     img_url = img_tag['src'] if img_tag and img_tag.get('src') else ""
 
                     logger.info(f"🔔 Nouvelle annonce : {title} - {price}\n🔗 {link}")
                     send_to_discord(title, price, link, img_url)
-                    time.sleep(1.5)  # Ajoute une pause de 1,5 seconde
-                    
+                    time.sleep(1.5)
+
                 except Exception as e:
                     logger.error(f"Erreur traitement annonce pour l'URL {url}: {e}")
-                    # ALERTE POUR ERREUR INTERNE DE TRAITEMENT
                     send_error_alert("Erreur Traitement Annonce", e, url)
 
             total_new_items += new_items_count
@@ -207,8 +214,7 @@ def check_vinted():
             logger.error(f"Erreur scraping pour l'URL {url}: {e}")
             send_error_alert("Erreur Inconnue", e, url)
 
-
-    save_seen(seen_items)
+    seen_items = save_seen(seen_items)
     logger.info("💾 Fichier seen.json mis à jour après ce scraping")
 
     if total_new_items == 0:
@@ -225,9 +231,8 @@ def bot_loop():
         logger.info("▶️ Nouvelle analyse...")
         check_vinted()
 
-        # Sleep aléatoire mais ne dépasse pas la fin du run
-        delay = random.uniform(150, 240)  # 2min30 à 4 min
-        
+        # Pause aléatoire entre 2 et 5 minutes, sans dépasser la fin du run
+        delay = random.uniform(120, 300)
         time_remaining = end_time - time.time()
         if time_remaining <= 0:
             break
@@ -236,7 +241,7 @@ def bot_loop():
         time.sleep(sleep_time)
 
     logger.info("🏁 Fin du run")
-    save_seen(seen_items)  # sauvegarde finale
+    save_seen(seen_items)
     send_status_message("✅ Run terminé !")
 
 # ----------------------
