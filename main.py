@@ -4,6 +4,8 @@ import os
 import logging
 import requests
 import json
+import re
+import unicodedata
 from urllib.parse import urlparse, parse_qs
 
 # ----------------------
@@ -120,6 +122,38 @@ def build_api_params(vinted_url):
     if catalog_ids:
         params["catalog_ids"] = ",".join(catalog_ids)
     return params
+
+def _normalize(text):
+    """Minuscules, sans accents, sans ponctuation - pour comparer des titres
+    de façon tolérante (accents, apostrophes, casse)."""
+    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode()
+    text = re.sub(r"[^a-z0-9\s]", " ", text.lower())
+    return text
+
+_STOPWORDS = {
+    "les", "des", "de", "du", "la", "le", "un", "une", "et", "a", "au", "aux",
+    "en", "sur", "sous", "dans", "pour", "avec", "sans", "ce", "ces", "cette",
+    "est", "sont", "que", "qui", "se", "son", "sa", "ses",
+}
+
+def title_matches_search(title, search_text):
+    """Filtre de sécurité côté script : l'API Vinted ne semble pas toujours
+    appliquer strictement le filtre search_text (des annonces hors-sujet
+    peuvent remonter). On exclut les mots vides (les, de, l'...) puis on
+    exige qu'une large majorité des mots significatifs de la recherche
+    apparaissent dans le titre de l'annonce."""
+    if not search_text:
+        return True
+    search_words = [
+        w for w in _normalize(search_text).split()
+        if len(w) > 2 and w not in _STOPWORDS
+    ]
+    if not search_words:
+        return True
+    norm_title = _normalize(title)
+    matched = sum(1 for w in search_words if w in norm_title)
+    required = max(1, -(-len(search_words) * 6 // 10))  # ceil(60%)
+    return matched >= required
 
 def parse_item(item):
     """Extrait titre / prix / lien / photo d'un item JSON de l'API, en gérant
@@ -247,6 +281,7 @@ def check_vinted():
                 continue
 
             new_items_count = 0
+            search_text = params.get("search_text", "")
 
             for item in items[:20]:
                 try:
@@ -255,6 +290,11 @@ def check_vinted():
                         continue
 
                     if link in seen_items:
+                        continue
+
+                    if not title_matches_search(title, search_text):
+                        logger.info(f"🚫 Annonce ignorée (hors-sujet) : {title}")
+                        seen_items[link] = now  # on la marque vue pour ne pas la retraiter à chaque run
                         continue
 
                     seen_items[link] = now
